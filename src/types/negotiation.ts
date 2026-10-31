@@ -89,6 +89,7 @@ export interface NegotiationState {
   id?: string;
   role?: string;
   createdAt?: string;
+  updatedAt?: string;
   /** Candidate specific data */
   candidate: CandidateProfile;
   /** HR‑only private data */
