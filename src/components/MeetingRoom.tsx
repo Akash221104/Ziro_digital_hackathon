@@ -34,6 +34,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isCandidateSpeaking, setIsCandidateSpeaking] = useState(false);
   const [candidateCaption, setCandidateCaption] = useState<string>("");
+  const [isListening, setIsListening] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [speechError, setSpeechError] = useState<string | null>(null);
 
   const shortName = candidateName ? candidateName.split(" ")[0] : "there";
   const greetingText = `Hello ${shortName}! Welcome. I'm your AI HR partner. What compensation range are you targeting for this role?`;
@@ -55,6 +58,11 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const activeAudioSessionIdRef = useRef<number>(0);
   const speechSafetyTimerRef = useRef<any>(null);
   const isMountedRef = useRef<boolean>(true);
+  const isRecognizingRef = useRef<boolean>(false);
+  const shouldListenRef = useRef<boolean>(false);
+  const restartTimerRef = useRef<any>(null);
+  const handleProcessCandidateMessageRef = useRef<any>(null);
+  const stopAllAudioRef = useRef<any>(null);
 
   // Client-side sanitization: Guarantees raw JSON or "thought" never leaks to screen or voice
   const cleanCaptionAndVoice = useCallback((text: string): string => {
@@ -77,6 +85,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
   // Stop any ongoing audio immediately to guarantee only 1 voice plays
   const stopAllAudio = useCallback(() => {
+    activeAudioSessionIdRef.current++;
     if (speechSafetyTimerRef.current) {
       clearTimeout(speechSafetyTimerRef.current);
       speechSafetyTimerRef.current = null;
@@ -350,21 +359,16 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const handleProcessCandidateMessage = useCallback(
     async (messageText: string) => {
       const cleaned = messageText.trim();
-      if (!cleaned || isBusyProcessingRef.current || isAudioLockedRef.current) return;
+      if (!cleaned || isBusyProcessingRef.current) return;
 
       if (lastProcessedTextRef.current === cleaned) return;
       lastProcessedTextRef.current = cleaned;
 
-      // Synchronous atomic lock to prevent any duplicate execution
+      // Stop any AI speech immediately when candidate speaks/submits
+      stopAllAudio();
+
       isBusyProcessingRef.current = true;
       setIsProcessing(true);
-
-      // Immediately abort recognition while processing
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {}
-      }
 
       try {
         const res = await postMessage(negotiationId, cleaned);
@@ -381,109 +385,229 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         setIsProcessing(false);
       }
     },
-    [negotiationId, playAiVoice, cleanCaptionAndVoice]
+    [negotiationId, playAiVoice, cleanCaptionAndVoice, stopAllAudio]
   );
 
-  // Continuous, resilient Speech Recognition (handles candidate speech & interruptions)
+  // Keep references stable for event listeners to avoid teardowns
+  handleProcessCandidateMessageRef.current = handleProcessCandidateMessage;
+  stopAllAudioRef.current = stopAllAudio;
+
+  // Real-time hardware microphone volume meter via Web Audio API
+  useEffect(() => {
+    if (!localStream || !micEnabled || !hasStarted) {
+      setAudioLevel(0);
+      return;
+    }
+
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0 || !audioTracks[0].enabled) {
+      setAudioLevel(0);
+      return;
+    }
+
+    let audioContext: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let animId: number;
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      audioContext = new AudioCtx();
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.4;
+
+      source = audioContext.createMediaStreamSource(localStream);
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      const checkVolume = () => {
+        if (!isMountedRef.current) return;
+        analyser?.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const avg = sum / dataArray.length;
+        const normalized = Math.min(100, Math.round((avg / 128) * 100));
+        setAudioLevel(normalized);
+
+        // If candidate speaks aloud while AI is talking, interrupt AI immediately!
+        if (normalized > 18 && isAiSpeaking) {
+          stopAllAudioRef.current?.();
+        }
+
+        animId = requestAnimationFrame(checkVolume);
+      };
+
+      checkVolume();
+    } catch (err) {
+      console.warn("Audio meter init notice:", err);
+    }
+
+    return () => {
+      if (animId) cancelAnimationFrame(animId);
+      if (source) {
+        try {
+          source.disconnect();
+        } catch {}
+      }
+      if (audioContext && audioContext.state !== "closed") {
+        try {
+          audioContext.close();
+        } catch {}
+      }
+    };
+  }, [localStream, micEnabled, hasStarted, isAiSpeaking]);
+
+  // Safe Start & Stop controllers for Speech Recognition
+  const startListening = useCallback(() => {
+    if (!recognitionRef.current || isRecognizingRef.current || !shouldListenRef.current) {
+      return;
+    }
+    try {
+      recognitionRef.current.start();
+      isRecognizingRef.current = true;
+      setIsListening(true);
+    } catch (err: any) {
+      if (err?.name === "InvalidStateError") {
+        isRecognizingRef.current = true;
+        setIsListening(true);
+      } else {
+        console.warn("Speech recognition start notice:", err);
+      }
+    }
+  }, []);
+
+  const stopListening = useCallback(() => {
+    shouldListenRef.current = false;
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+    }
+    isRecognizingRef.current = false;
+    setIsListening(false);
+  }, []);
+
+  // Continuous, resilient Speech Recognition lifecycle
   useEffect(() => {
     if (!hasStarted) return;
+
+    if (!micEnabled) {
+      stopListening();
+      return;
+    }
+
+    shouldListenRef.current = true;
 
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "en-IN";
-
-      recognition.onresult = (event: any) => {
-        // Only reject if actively awaiting LLM HTTP response
-        if (isBusyProcessingRef.current) return;
-
-        let interim = "";
-        let final = "";
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            final += transcript;
-          } else {
-            interim += transcript;
-          }
-        }
-
-        const candidateText = (final || interim).trim();
-        if (candidateText && candidateText.length >= 2) {
-          // If candidate speaks, immediately silence AI and unlock audio
-          stopAllAudio();
-
-          setCandidateCaption(candidateText);
-          setIsCandidateSpeaking(true);
-
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-            silenceTimerRef.current = null;
-          }
-
-          if (final) {
-            setIsCandidateSpeaking(false);
-            handleProcessCandidateMessage(final);
-          } else {
-            // Fast 600ms silence-debounce for instant spoken response
-            silenceTimerRef.current = setTimeout(() => {
-              if (candidateText.length >= 2 && !isBusyProcessingRef.current) {
-                setIsCandidateSpeaking(false);
-                handleProcessCandidateMessage(candidateText);
-              }
-            }, 600);
-          }
-        }
-      };
-
-      recognition.onerror = (e: any) => {
-        console.warn("Speech recognition notice:", e?.error);
-        setIsCandidateSpeaking(false);
-        if (e?.error === "language-not-supported") {
-          recognition.lang = "en-US";
-        }
-        if (micEnabled && hasStarted && e?.error !== "not-allowed") {
-          setTimeout(() => {
-            try {
-              recognition.start();
-            } catch {}
-          }, 300);
-        }
-      };
-
-      recognition.onend = () => {
-        if (micEnabled && hasStarted) {
-          try {
-            recognition.start();
-          } catch {}
-        }
-      };
-
-      if (micEnabled) {
-        try {
-          recognition.start();
-        } catch {}
-      }
-
-      recognitionRef.current = recognition;
+    if (!SpeechRecognition) {
+      console.warn("SpeechRecognition not supported in this browser.");
+      setSpeechError("Speech recognition not supported in your browser. You can type in the box below.");
+      return;
     }
 
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+    recognition.lang =
+      typeof navigator !== "undefined" && navigator.language ? navigator.language : "en-US";
+
+    recognition.onstart = () => {
+      isRecognizingRef.current = true;
+      setIsListening(true);
+      setSpeechError(null);
+    };
+
+    recognition.onresult = (event: any) => {
+      if (isBusyProcessingRef.current) return;
+
+      let interim = "";
+      let final = "";
+
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          final += transcript;
+        } else {
+          interim += transcript;
+        }
+      }
+
+      const candidateText = (final || interim).trim();
+      if (candidateText && candidateText.length >= 2) {
+        // If candidate speaks, instantly silence AI
+        stopAllAudioRef.current?.();
+
+        setCandidateCaption(candidateText);
+        setIsCandidateSpeaking(true);
+
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
+
+        if (final && final.trim().length >= 2) {
+          setIsCandidateSpeaking(false);
+          handleProcessCandidateMessageRef.current?.(final.trim());
+        } else {
+          // 850ms silence-debounce allows natural conversational pauses
+          silenceTimerRef.current = setTimeout(() => {
+            if (candidateText.trim().length >= 2 && !isBusyProcessingRef.current) {
+              setIsCandidateSpeaking(false);
+              handleProcessCandidateMessageRef.current?.(candidateText.trim());
+            }
+          }, 850);
+        }
+      }
+    };
+
+    recognition.onerror = (e: any) => {
+      console.warn("Speech recognition notice:", e?.error);
+      setIsCandidateSpeaking(false);
+
+      if (e?.error === "language-not-supported") {
+        recognition.lang = "en-US";
+      } else if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+        setSpeechError("Microphone permission was denied. Please allow microphone in browser address bar.");
+        shouldListenRef.current = false;
+        setIsListening(false);
+      }
+      // On non-fatal errors like 'no-speech' or 'audio-capture', onend will fire and restart safely
+    };
+
+    recognition.onend = () => {
+      isRecognizingRef.current = false;
+      setIsListening(false);
+
+      if (shouldListenRef.current && isMountedRef.current && micEnabled) {
+        if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = setTimeout(() => {
+          startListening();
+        }, 200);
+      }
+    };
+
+    recognitionRef.current = recognition;
+    startListening();
+
     return () => {
+      stopListening();
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
       }
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {}
-      }
     };
-  }, [hasStarted, micEnabled, handleProcessCandidateMessage, stopAllAudio]);
+  }, [hasStarted, micEnabled, startListening, stopListening]);
 
   // Start Meeting Handler
   const handleStartMeeting = async () => {
@@ -499,15 +623,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       silentAudio.play().catch(() => {});
     } catch {}
 
+    // 2. Await camera & mic permissions FIRST so SpeechRecognition doesn't race
+    let stream: MediaStream | null = null;
+    try {
+      stream = await startCameraAndMic();
+      if (stream) connectLiveKit(stream);
+    } catch (e) {
+      console.warn("Start camera/mic notice:", e);
+    }
+
+    // 3. Mark meeting started (triggers SpeechRecognition with permissions ready)
     setHasStarted(true);
     setAiCaption(greetingText);
 
-    // 2. Start camera & LiveKit in background so video mounts immediately
-    startCameraAndMic().then((stream) => {
-      if (stream) connectLiveKit(stream);
-    });
-
-    // 3. Trigger initial greeting without blocking on camera spin-up
+    // 4. Trigger initial greeting
     playAiVoice(greetingText);
   };
 
@@ -560,18 +689,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         audioTrack.enabled = nextState;
       }
     }
-    if (!nextState && recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {}
+    if (nextState) {
+      shouldListenRef.current = true;
+      startListening();
+    } else {
+      stopListening();
     }
   };
 
   const handleManualTextSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!textInput.trim() || isProcessing || isAudioLockedRef.current) return;
+    if (!textInput.trim() || isProcessing) return;
     const msg = textInput.trim();
     setTextInput("");
+    stopAllAudio();
     setCandidateCaption(msg);
     handleProcessCandidateMessage(msg);
   };
@@ -603,7 +734,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       {/* Primary Video Grid: Exactly 2 Views */}
       <div className="grid md:grid-cols-2 gap-4 flex-1 min-h-[420px]">
         {/* View 1: Candidate Video */}
-        <div className="relative rounded-3xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800 shadow-xl group">
+        <div
+          className={`relative rounded-3xl bg-slate-900 overflow-hidden flex items-center justify-center border transition-all duration-300 shadow-xl group ${
+            isCandidateSpeaking || audioLevel > 15
+              ? "border-emerald-500 shadow-emerald-500/20 ring-2 ring-emerald-500/30"
+              : "border-slate-800"
+          }`}
+        >
           <video
             ref={(el) => {
               videoRef.current = el;
@@ -630,16 +767,48 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
             </div>
           )}
 
-          {/* Participant Label & Mic Badge */}
-          <div className="absolute top-4 left-4 bg-slate-900/80 backdrop-blur-md px-3.5 py-1.5 rounded-full flex items-center gap-2 text-xs font-semibold text-white border border-white/10">
+          {/* Participant Label & Real-time Mic Activity Badge */}
+          <div className="absolute top-4 left-4 bg-slate-900/85 backdrop-blur-md px-3.5 py-1.5 rounded-full flex items-center gap-2 text-xs font-semibold text-white border border-white/10 shadow-md">
             <span>{candidateName || "Candidate"} (You)</span>
-            {isCandidateSpeaking && (
-              <span className="flex h-2 w-2 relative">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+
+            {micEnabled ? (
+              <div className="flex items-center gap-1.5 pl-1.5 border-l border-white/20">
+                {/* Audio Equalizer Bars */}
+                <div className="flex items-end gap-0.5 h-3.5 w-4">
+                  <span
+                    className="w-1 bg-emerald-400 rounded-full transition-all duration-75"
+                    style={{ height: `${Math.max(20, Math.min(100, audioLevel * 1.5))}%` }}
+                  />
+                  <span
+                    className="w-1 bg-emerald-400 rounded-full transition-all duration-75"
+                    style={{ height: `${Math.max(25, Math.min(100, audioLevel * 2.2))}%` }}
+                  />
+                  <span
+                    className="w-1 bg-emerald-400 rounded-full transition-all duration-75"
+                    style={{ height: `${Math.max(15, Math.min(100, audioLevel * 1.2))}%` }}
+                  />
+                </div>
+                <span className="text-[10px] text-emerald-400 font-bold uppercase tracking-wider">
+                  {isCandidateSpeaking || audioLevel > 15
+                    ? "Speaking"
+                    : isListening
+                    ? "Listening"
+                    : "Ready"}
+                </span>
+              </div>
+            ) : (
+              <span className="text-[10px] text-rose-400 font-bold uppercase tracking-wider pl-1.5 border-l border-white/20">
+                Muted
               </span>
             )}
           </div>
+
+          {/* Speech Error Banner */}
+          {speechError && (
+            <div className="absolute top-14 left-4 right-4 bg-amber-950/90 border border-amber-500/40 text-amber-200 text-xs p-2.5 rounded-xl backdrop-blur-md">
+              {speechError}
+            </div>
+          )}
 
           {/* Captions Overlay for Candidate */}
           {candidateCaption && (
