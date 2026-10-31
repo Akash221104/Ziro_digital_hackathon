@@ -30,6 +30,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const [hasStarted, setHasStarted] = useState(false);
   const [micEnabled, setMicEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isCandidateSpeaking, setIsCandidateSpeaking] = useState(false);
   const [candidateCaption, setCandidateCaption] = useState<string>("");
@@ -52,6 +53,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const isAudioLockedRef = useRef<boolean>(false);
   const isBusyProcessingRef = useRef<boolean>(false);
   const activeAudioSessionIdRef = useRef<number>(0);
+  const speechSafetyTimerRef = useRef<any>(null);
   const isMountedRef = useRef<boolean>(true);
 
   // Client-side sanitization: Guarantees raw JSON or "thought" never leaks to screen or voice
@@ -75,6 +77,10 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
   // Stop any ongoing audio immediately to guarantee only 1 voice plays
   const stopAllAudio = useCallback(() => {
+    if (speechSafetyTimerRef.current) {
+      clearTimeout(speechSafetyTimerRef.current);
+      speechSafetyTimerRef.current = null;
+    }
     if (currentAudioRef.current) {
       try {
         currentAudioRef.current.pause();
@@ -88,6 +94,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       } catch {}
     }
     isAudioLockedRef.current = false;
+    setIsAiSpeaking(false);
   }, []);
 
   // Fallback Web Speech Synthesis (Fast 1.35x rate with professional Indian English voice)
@@ -100,6 +107,11 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         stopAllAudio();
         isAudioLockedRef.current = true;
         setIsAiSpeaking(true);
+
+        try {
+          window.speechSynthesis.cancel();
+          window.speechSynthesis.resume();
+        } catch {}
 
         const utterance = new SpeechSynthesisUtterance(text);
 
@@ -123,13 +135,26 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           utterance.voice = indianVoice;
         }
 
+        // Keep anchor on window to prevent V8 garbage collector from dropping onend event
+        (window as any).__activeUtterance = utterance;
+
+        // Auto-release safety timer in case Chrome onend is delayed
+        if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
+        const estDuration = Math.max(2500, (text.split(" ").length / 2.5) * 1000 + 1000);
+        speechSafetyTimerRef.current = setTimeout(() => {
+          setIsAiSpeaking(false);
+          isAudioLockedRef.current = false;
+        }, estDuration);
+
         utterance.onend = () => {
+          if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
           if (sessionId === activeAudioSessionIdRef.current) {
             setIsAiSpeaking(false);
             isAudioLockedRef.current = false;
           }
         };
         utterance.onerror = () => {
+          if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
           if (sessionId === activeAudioSessionIdRef.current) {
             setIsAiSpeaking(false);
             isAudioLockedRef.current = false;
@@ -143,13 +168,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
             setIsAiSpeaking(false);
             isAudioLockedRef.current = false;
           }
-        }, 1800);
+        }, 1500);
       }
     },
     [stopAllAudio, cleanCaptionAndVoice]
   );
 
-  // Play voice through VerbX TTS at 1.35x speed with strict single-voice lock
+  // Play voice through VerbX TTS at 1.35x speed with strict single-voice lock & 2s timeout
   const playAiVoice = useCallback(
     async (rawText: string) => {
       const text = cleanCaptionAndVoice(rawText);
@@ -161,19 +186,26 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       isAudioLockedRef.current = true;
       setIsAiSpeaking(true);
 
-      // Temporarily abort recognition so mic doesn't capture AI's own audio
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {}
-      }
+      // Auto-release safety timer in case audio playback stalls
+      if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
+      const estDuration = Math.max(2500, (text.split(" ").length / 2.5) * 1000 + 1500);
+      speechSafetyTimerRef.current = setTimeout(() => {
+        setIsAiSpeaking(false);
+        isAudioLockedRef.current = false;
+      }, estDuration);
+
+      // Fast 2-second timeout to prevent any hanging cold start
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
 
       try {
         const ttsRes = await fetch("/api/verbx/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text }),
+          signal: controller.signal,
         });
+        clearTimeout(timeoutId);
 
         // If another speech session began while fetch was resolving, discard this one
         if (sessionId !== activeAudioSessionIdRef.current || !isMountedRef.current) {
@@ -182,7 +214,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
         if (ttsRes.ok) {
           const contentType = ttsRes.headers.get("content-type");
-          if (contentType && (contentType.includes("audio") || contentType.includes("ogg"))) {
+          if (contentType && (contentType.includes("audio") || contentType.includes("ogg") || contentType.includes("mpeg"))) {
             const blob = await ttsRes.blob();
             if (sessionId !== activeAudioSessionIdRef.current || !isMountedRef.current) {
               return;
@@ -199,6 +231,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
               currentAudioRef.current = audio;
 
               audio.onended = () => {
+                if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
                 if (sessionId === activeAudioSessionIdRef.current) {
                   setIsAiSpeaking(false);
                   isAudioLockedRef.current = false;
@@ -208,6 +241,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
               };
 
               audio.onerror = () => {
+                if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
                 currentAudioRef.current = null;
                 if (sessionId === activeAudioSessionIdRef.current) {
                   fallbackBrowserTTS(text);
@@ -220,6 +254,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           }
         }
       } catch (err) {
+        clearTimeout(timeoutId);
         console.warn("VerbX TTS notice, utilizing client speech engine:", err);
       }
 
@@ -234,6 +269,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const startCameraAndMic = useCallback(async () => {
     try {
       if (localStreamRef.current && localStreamRef.current.active) {
+        setLocalStream(localStreamRef.current);
         if (videoRef.current) {
           videoRef.current.srcObject = localStreamRef.current;
           await videoRef.current.play().catch(() => {});
@@ -241,12 +277,14 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         return localStreamRef.current;
       }
 
+      // Fast unconstrained audio & video for instant webcam startup
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+        video: true,
         audio: true,
       });
 
       localStreamRef.current = stream;
+      setLocalStream(stream);
       setCameraEnabled(true);
       setMicEnabled(true);
 
@@ -260,6 +298,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       try {
         const videoOnly = await navigator.mediaDevices.getUserMedia({ video: true });
         localStreamRef.current = videoOnly;
+        setLocalStream(videoOnly);
         if (videoRef.current) {
           videoRef.current.srcObject = videoOnly;
           await videoRef.current.play().catch(() => {});
@@ -345,7 +384,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     [negotiationId, playAiVoice, cleanCaptionAndVoice]
   );
 
-  // Fast Speech Recognition with 600ms silence detection and strict lock
+  // Continuous, resilient Speech Recognition (handles candidate speech & interruptions)
   useEffect(() => {
     if (!hasStarted) return;
 
@@ -359,8 +398,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       recognition.lang = "en-IN";
 
       recognition.onresult = (event: any) => {
-        // Do not process speech while AI is speaking or already processing
-        if (isAudioLockedRef.current || isBusyProcessingRef.current) return;
+        // Only reject if actively awaiting LLM HTTP response
+        if (isBusyProcessingRef.current) return;
 
         let interim = "";
         let final = "";
@@ -375,7 +414,10 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         }
 
         const candidateText = (final || interim).trim();
-        if (candidateText) {
+        if (candidateText && candidateText.length >= 2) {
+          // If candidate speaks, immediately silence AI and unlock audio
+          stopAllAudio();
+
           setCandidateCaption(candidateText);
           setIsCandidateSpeaking(true);
 
@@ -388,13 +430,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
             setIsCandidateSpeaking(false);
             handleProcessCandidateMessage(final);
           } else {
-            // Fast 600ms silence-debounce for instant response
+            // Fast 600ms silence-debounce for instant spoken response
             silenceTimerRef.current = setTimeout(() => {
-              if (
-                candidateText.length > 1 &&
-                !isAudioLockedRef.current &&
-                !isBusyProcessingRef.current
-              ) {
+              if (candidateText.length >= 2 && !isBusyProcessingRef.current) {
                 setIsCandidateSpeaking(false);
                 handleProcessCandidateMessage(candidateText);
               }
@@ -403,24 +441,30 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         }
       };
 
-      recognition.onerror = () => {
+      recognition.onerror = (e: any) => {
+        console.warn("Speech recognition notice:", e?.error);
         setIsCandidateSpeaking(false);
+        if (e?.error === "language-not-supported") {
+          recognition.lang = "en-US";
+        }
+        if (micEnabled && hasStarted && e?.error !== "not-allowed") {
+          setTimeout(() => {
+            try {
+              recognition.start();
+            } catch {}
+          }, 300);
+        }
       };
 
       recognition.onend = () => {
-        if (
-          micEnabled &&
-          hasStarted &&
-          !isAudioLockedRef.current &&
-          !isBusyProcessingRef.current
-        ) {
+        if (micEnabled && hasStarted) {
           try {
             recognition.start();
           } catch {}
         }
       };
 
-      if (micEnabled && !isAudioLockedRef.current) {
+      if (micEnabled) {
         try {
           recognition.start();
         } catch {}
@@ -439,48 +483,44 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         } catch {}
       }
     };
-  }, [hasStarted, micEnabled, handleProcessCandidateMessage]);
-
-  // Pause recognition while AI speaks, resume after speech finishes with 400ms buffer
-  useEffect(() => {
-    let resumeTimer: any = null;
-    if (isAiSpeaking && recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch {}
-    } else if (!isAiSpeaking && micEnabled && hasStarted && recognitionRef.current) {
-      resumeTimer = setTimeout(() => {
-        if (!isAiSpeaking && !isAudioLockedRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch {}
-        }
-      }, 400);
-    }
-    return () => {
-      if (resumeTimer) clearTimeout(resumeTimer);
-    };
-  }, [isAiSpeaking, micEnabled, hasStarted]);
+  }, [hasStarted, micEnabled, handleProcessCandidateMessage, stopAllAudio]);
 
   // Start Meeting Handler
   const handleStartMeeting = async () => {
+    // 1. Instantly prime/unlock browser audio during the user click gesture
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.resume();
+      } catch {}
+    }
+    try {
+      const silentAudio = new Audio();
+      silentAudio.play().catch(() => {});
+    } catch {}
+
     setHasStarted(true);
-
-    const stream = await startCameraAndMic();
-    connectLiveKit(stream);
-
-    // Speak initial greeting
     setAiCaption(greetingText);
+
+    // 2. Start camera & LiveKit in background so video mounts immediately
+    startCameraAndMic().then((stream) => {
+      if (stream) connectLiveKit(stream);
+    });
+
+    // 3. Trigger initial greeting without blocking on camera spin-up
     playAiVoice(greetingText);
   };
 
-  // Re-attach video stream
+  // Re-attach video stream whenever localStream or hasStarted updates
   useEffect(() => {
-    if (hasStarted && videoRef.current && localStreamRef.current) {
-      videoRef.current.srcObject = localStreamRef.current;
-      videoRef.current.play().catch(() => {});
+    if (hasStarted && videoRef.current && (localStream || localStreamRef.current)) {
+      const s = localStream || localStreamRef.current;
+      if (videoRef.current.srcObject !== s) {
+        videoRef.current.srcObject = s;
+        videoRef.current.play().catch(() => {});
+      }
     }
-  }, [hasStarted]);
+  }, [hasStarted, localStream]);
 
   // Clean teardown on unmount
   useEffect(() => {
@@ -565,7 +605,14 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         {/* View 1: Candidate Video */}
         <div className="relative rounded-3xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800 shadow-xl group">
           <video
-            ref={videoRef}
+            ref={(el) => {
+              videoRef.current = el;
+              const s = localStream || localStreamRef.current;
+              if (el && s && el.srcObject !== s) {
+                el.srcObject = s;
+                el.play().catch(() => {});
+              }
+            }}
             autoPlay
             playsInline
             muted
